@@ -1,0 +1,35 @@
+# Dockerfile.local — llama-server with an Apache-2.0 decision model baked in, for air-gapped hosts.
+#
+# Build (on a machine WITH internet), then `docker save` the image and load it on the target host:
+#   docker build -f backend/Dockerfile.local -t timeplus/decision-local:decider-2b-q8_0 \
+#       --build-arg MODEL_FILE=decider-2b-q8_0.gguf --build-arg MODEL_SHA256=<sha256> backend/
+#   docker save timeplus/decision-local:decider-2b-q8_0 | gzip > decision-local.tar.gz
+#
+# Put the GGUF at backend/models/<MODEL_FILE> before building. Candidate Apache-2.0 models (re-check the
+# license on the model card before shipping): Strands Decider 2B (Q8_0), Kev-4B (Q8_0), Jeff-0.8B (Q8_0).
+# For CUDA use base image ghcr.io/ggml-org/llama.cpp:server-cuda and run with --gpus 1.
+
+ARG BASE=ghcr.io/ggml-org/llama.cpp:server
+FROM ${BASE}
+
+ARG MODEL_FILE=decider-2b-q8_0.gguf
+ARG MODEL_SHA256=
+ENV MODEL_PATH=/models/${MODEL_FILE} \
+    MODEL_SHA256=${MODEL_SHA256} \
+    HF_HUB_OFFLINE=1 \
+    LLAMA_ARG_HOST=0.0.0.0 \
+    LLAMA_ARG_PORT=8080 \
+    LLAMA_ARG_CTX_SIZE=4096 \
+    LLAMA_ARG_N_PARALLEL=8
+
+COPY models/${MODEL_FILE} /models/${MODEL_FILE}
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+LABEL org.opencontainers.image.title="timeplus decision-local" \
+      org.opencontainers.image.description="llama-server /v1/systemone with a bundled decision model" \
+      decision.model.file="${MODEL_FILE}" \
+      decision.model.sha256="${MODEL_SHA256}"
+
+EXPOSE 8080
+ENTRYPOINT ["/entrypoint.sh"]

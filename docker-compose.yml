@@ -1,0 +1,91 @@
+# docker-compose.yml — one-command demo: engine + decision backend + generators (random streams inside the engine).
+#
+#   cp .env.example .env
+#   docker compose --profile ollama up -d          # Proton OSS + Ollama (local decision model)   <- default demo
+#   docker compose --profile fake   up -d          # Proton OSS + fake /v1/systemone (no model)
+#   docker compose                  up -d          # Proton OSS only; backend = jev (cloud) via .env
+#   ENGINE=enterprise docker compose --profile ollama up -d    # same, on Timeplus Enterprise
+#   ./scripts/pull_model.sh                        # (ollama profile) pull the decision model once
+#   python3 scripts/setup.py                       # streams, UDFs, both use cases
+#
+# Mac with Apple GPU: run Ollama natively on the host instead of the container and set
+#   DECISION_BASE_URL=http://host.docker.internal:11434  in .env (Docker on macOS has no GPU access).
+
+x-engine-env: &engine-env
+  DECISION_BACKEND: ${DECISION_BACKEND:-local}
+  DECISION_BASE_URL: ${DECISION_BASE_URL:-http://decision:11434}
+  DECISION_MODEL: ${DECISION_MODEL:-}
+  TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+
+services:
+  timeplus:
+    image: ${ENGINE_IMAGE:-ghcr.io/timeplus-io/proton:latest}
+    container_name: tp-decision-poc
+    ports:
+      - "8463:8463"   # native
+      - "3218:3218"   # Proton REST
+      - "8123:8123"   # SQL over HTTP (setup.py uses this)
+      - "8000:8000"   # Enterprise console/REST (ignored by Proton)
+    environment:
+      <<: *engine-env
+    volumes:
+      - ./sql:/sql:ro
+      - tp-data:/var/lib/proton
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8123/ping || curl -sf http://localhost:3218/proton/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Backend B (default): Ollama serving /v1/systemone with a decision model from its library.
+  decision-ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    container_name: tp-decision-ollama
+    networks:
+      default:
+        aliases: ["decision"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama     # pre-pulled models survive restarts; copy this volume for air-gapped hosts
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_NUM_PARALLEL: "8"
+    # NVIDIA GPU on Linux: uncomment
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+
+  # Backend B (no model): stdlib fake /v1/systemone, for wiring and chaos tests.
+  decision-fake:
+    profiles: ["fake"]
+    image: python:3.12-slim
+    container_name: tp-decision-fake
+    command: ["python", "/app/fake_systemone.py", "--port", "11434", "--latency-ms", "${FAKE_LATENCY_MS:-120}", "--jitter-ms", "60", "--fail-rate", "${FAKE_FAIL_RATE:-0}"]
+    volumes:
+      - ./backend/fake_systemone.py:/app/fake_systemone.py:ro
+    networks:
+      default:
+        aliases: ["decision"]
+    ports:
+      - "11434:11434"
+
+  # Backend B (alternative packaging): llama-server with the GGUF baked into the image (backend/Dockerfile.local).
+  decision-llama:
+    profiles: ["llama"]
+    image: ${DECISION_LOCAL_IMAGE:-timeplus/decision-local:decider-2b-q8_0}
+    container_name: tp-decision-llama
+    command: ["--port", "11434"]
+    networks:
+      default:
+        aliases: ["decision"]
+    ports:
+      - "11434:11434"
+
+volumes:
+  tp-data:
+  ollama-models:
