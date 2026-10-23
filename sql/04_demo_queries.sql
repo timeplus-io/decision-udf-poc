@@ -49,7 +49,7 @@ FROM tumble(decision_log, 1m)
 GROUP BY window_start, backend, model, err;
 
 -- G. What the model is actually shown (one recent QoE window state).
-SELECT window_start, truth, rule_flag, state FROM table(qoe_windows) ORDER BY window_start DESC LIMIT 3;
+SELECT win_start, truth, rule_flag, state FROM table(qoe_windows) ORDER BY win_start DESC LIMIT 3;
 
 -- H. Results for the report (table query over everything so far).
 SELECT use_case, qtype, backend, model, count() AS n,

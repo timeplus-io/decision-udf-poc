@@ -1,41 +1,55 @@
-# docker-compose.yml — one-command demo: engine + decision backend + generators (random streams inside the engine).
+# docker-compose.yml — one-command demo: Timeplus Enterprise + a decision backend. Data is generated inside the
+# engine with random streams; the decision model is called from a Python UDF that also runs inside the engine.
 #
 #   cp .env.example .env
-#   docker compose --profile ollama up -d          # Proton OSS + Ollama (local decision model)   <- default demo
-#   docker compose --profile fake   up -d          # Proton OSS + fake /v1/systemone (no model)
-#   docker compose                  up -d          # Proton OSS only; backend = jev (cloud) via .env
-#   ENGINE=enterprise docker compose --profile ollama up -d    # same, on Timeplus Enterprise
+#   docker compose --profile ollama up -d          # engine + Ollama (local decision model)        <- default demo
+#   docker compose --profile fake   up -d          # engine + fake /v1/systemone (no model, wiring/chaos tests)
+#   docker compose                  up -d          # engine only; backend = jev (cloud) or a native Ollama via .env
 #   ./scripts/pull_model.sh                        # (ollama profile) pull the decision model once
-#   python3 scripts/setup.py                       # streams, UDFs, both use cases
+#   ./scripts/install.sh                           # streams, UDF, smoke test, both use cases (pure SQL)
+#
+# Python UDFs exist only in the amd64 build of Timeplus Enterprise, so the engine is pinned to linux/amd64;
+# on Apple silicon it runs under emulation (slower, but fine for the demo). Proton OSS has no Python UDF.
 #
 # Mac with Apple GPU: run Ollama natively on the host instead of the container and set
 #   DECISION_BASE_URL=http://host.docker.internal:11434  in .env (Docker on macOS has no GPU access).
 
 x-engine-env: &engine-env
+  TIMEPLUS_USER: ${TIMEPLUS_USER:-proton}
+  TIMEPLUS_PASSWORD: ${TIMEPLUS_PASSWORD:-timeplus@t+}
   DECISION_BACKEND: ${DECISION_BACKEND:-local}
   DECISION_BASE_URL: ${DECISION_BASE_URL:-http://decision:11434}
   DECISION_MODEL: ${DECISION_MODEL:-}
+  DECISION_PACK_ROWS: ${DECISION_PACK_ROWS:-}
+  DECISION_MAX_IN_FLIGHT: ${DECISION_MAX_IN_FLIGHT:-}
+  DECISION_TIMEOUT_S: ${DECISION_TIMEOUT_S:-}
+  DECISION_BLOCK_DEADLINE_S: ${DECISION_BLOCK_DEADLINE_S:-}
+  DECISION_RETRIES: ${DECISION_RETRIES:-}
+  DECISION_CACHE_TTL_S: ${DECISION_CACHE_TTL_S:-}
+  DECISION_TEMPERATURES: ${DECISION_TEMPERATURES:-}
   TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
 
 services:
   timeplus:
-    image: ${ENGINE_IMAGE:-ghcr.io/timeplus-io/proton:latest}
-    container_name: tp-decision-poc
+    image: ${ENGINE_IMAGE:-timeplus/timeplus-enterprise:3.4.1-rc.10}
+    platform: linux/amd64
+    container_name: ${ENGINE_CONTAINER:-tp-decision-poc}
     ports:
+      - "8000:8000"   # console
+      - "8123:8123"   # SQL over HTTP (user proton / timeplus@t+ by default)
       - "8463:8463"   # native
-      - "3218:3218"   # Proton REST
-      - "8123:8123"   # SQL over HTTP (setup.py uses this)
-      - "8000:8000"   # Enterprise console/REST (ignored by Proton)
+      - "3218:3218"   # REST
     environment:
       <<: *engine-env
+      ENABLE_DATA_PREALLOCATE: "false"   # otherwise timeplusd preallocates ~2 GB of native log per stream
     volumes:
-      - ./sql:/sql:ro
-      - tp-data:/var/lib/proton
+      - ./sql:/sql:ro                 # so `timeplusd client --queries-file /sql/...` works inside the container too
+      - tp-data:/timeplus/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8123/ping || curl -sf http://localhost:3218/proton/ping"]
+      test: ["CMD-SHELL", "timeplusd client -u $$TIMEPLUS_USER --password $$TIMEPLUS_PASSWORD -q 'SELECT 1'"]   # the image has no curl
       interval: 5s
       timeout: 3s
-      retries: 30
+      retries: 60
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -48,7 +62,7 @@ services:
       default:
         aliases: ["decision"]
     ports:
-      - "11434:11434"
+      - "11434:11434"   # clashes with a native Ollama on the host; use that one instead (see header)
     volumes:
       - ollama-models:/root/.ollama     # pre-pulled models survive restarts; copy this volume for air-gapped hosts
     environment:
@@ -60,7 +74,8 @@ services:
     #     reservations:
     #       devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
 
-  # Backend B (no model): stdlib fake /v1/systemone, for wiring and chaos tests.
+  # Backend B (no model): stdlib fake /v1/systemone in its own container, for wiring and chaos tests.
+  # Reachable from the engine as http://decision:11434; not published on the host.
   decision-fake:
     profiles: ["fake"]
     image: python:3.12-slim
@@ -71,8 +86,6 @@ services:
     networks:
       default:
         aliases: ["decision"]
-    ports:
-      - "11434:11434"
 
   # Backend B (alternative packaging): llama-server with the GGUF baked into the image (backend/Dockerfile.local).
   decision-llama:

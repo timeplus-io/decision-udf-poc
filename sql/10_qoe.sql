@@ -78,7 +78,7 @@ FROM (
 
 -- 4. condensed 5 s windows: what an operator's dashboard would show, plus the truth label
 CREATE STREAM IF NOT EXISTS qoe_windows (
-  window_start    datetime64(3),
+  win_start       datetime64(3),   -- window_start is a reserved column name
   events          uint32,
   sessions        uint32,
   load_ratio      float32,   -- requests per event; ~1 normally, 3 to 6 in a flash crowd
@@ -104,7 +104,7 @@ CREATE STREAM IF NOT EXISTS qoe_windows (
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_windows INTO qoe_windows AS
 SELECT
-  window_start, events, sessions, load_ratio, degraded_share, p95_rebuffer_ms, p50_startup_ms, p50_bitrate,
+  window_start AS win_start, events, sessions, load_ratio, degraded_share, p95_rebuffer_ms, p50_startup_ms, p50_bitrate,
   err_edge_503, err_seg_timeout, err_decoder, err_abr_null,
   deg_cdns, deg_isps, deg_regions, deg_players, deg_assets,
   (p95_rebuffer_ms > 1200 OR degraded_share > 0.08 OR load_ratio > 2.0)                              AS rule_flag,
@@ -153,7 +153,7 @@ FROM (
 -- 5. decisions: cause (choice) and severity (score), one each per window, into the shared log
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_decide_cause INTO decision_log AS
 SELECT
-  'qoe' AS use_case, window_start, 'global' AS cohort, question, 'choice' AS qtype,
+  'qoe' AS use_case, win_start, 'global' AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
   to_float32_or_null(json_extract_raw(d, 'p'))     AS p,
   to_float32_or_null(json_extract_raw(d, 'p_raw')) AS p_raw,
@@ -165,7 +165,7 @@ SELECT
   json_extract_string(d, 'err')                    AS err,
   rule_flag, truth, expected_cause AS expected, to_uint32(length(state)) AS state_chars
 FROM (
-  SELECT window_start, rule_flag, truth, expected_cause, state, question,
+  SELECT win_start, rule_flag, truth, expected_cause, state, question,
          decide_choice(state, question,
            '["cdn_fault","isp_congestion","player_bug","encoding_issue","traffic_spike_benign","no_incident"]') AS d
   FROM (
@@ -176,7 +176,7 @@ FROM (
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_decide_severity INTO decision_log AS
 SELECT
-  'qoe' AS use_case, window_start, 'global' AS cohort, question, 'score' AS qtype,
+  'qoe' AS use_case, win_start, 'global' AS cohort, question, 'score' AS qtype,
   json_extract_string(d, 'level')                  AS decision,
   to_float32_or_null(json_extract_raw(d, 'p'))     AS p,
   to_float32_or_null(json_extract_raw(d, 'p_raw')) AS p_raw,
@@ -188,7 +188,7 @@ SELECT
   json_extract_string(d, 'err')                    AS err,
   rule_flag, truth, expected_sev AS expected, to_uint32(length(state)) AS state_chars
 FROM (
-  SELECT window_start, rule_flag, truth, expected_sev, state, question,
+  SELECT win_start, rule_flag, truth, expected_sev, state, question,
          decide_score(state, question, '["negligible","minor","major","critical"]') AS d
   FROM (
     SELECT *, 'How severe is this window for viewers?' AS question

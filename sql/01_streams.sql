@@ -1,9 +1,9 @@
--- 01_streams.sql — shared streams. Works on Proton OSS 3.x and Timeplus Enterprise 3.x.
+-- 01_streams.sql — shared streams.
 
 -- Every decision the model makes, for both use cases, appended forever: audit trail and replay source.
 CREATE STREAM IF NOT EXISTS decision_log (
   use_case      string,              -- 'qoe' | 'ddos'
-  window_start  datetime64(3),
+  win_start     datetime64(3),       -- window_start is a reserved column name in Timeplus Enterprise
   cohort        string,              -- qoe: cdn|isp|region ; ddos: dst_ip
   question      string,
   qtype         string,              -- 'choice' | 'score' | 'noul'
