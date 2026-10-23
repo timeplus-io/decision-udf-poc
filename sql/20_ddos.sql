@@ -79,7 +79,7 @@ FROM (
 
 -- 4. condensed 5 s windows per protected service
 CREATE STREAM IF NOT EXISTS flow_windows (
-  window_start    datetime64(3),
+  win_start       datetime64(3),   -- window_start is a reserved column name
   dst_ip          string,
   records         uint32,
   pps             float32,
@@ -100,7 +100,7 @@ CREATE STREAM IF NOT EXISTS flow_windows (
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_flow_windows INTO flow_windows AS
 SELECT
-  window_start, dst_ip, records, pps, mbps, uniq_src, syn_only_ratio, udp_share, mean_pkt_bytes, uniq_dst_ports,
+  window_start AS win_start, dst_ip, records, pps, mbps, uniq_src, syn_only_ratio, udp_share, mean_pkt_bytes, uniq_dst_ports,
   p443, p80, p53, p123, p11211,
   (pps > 20000 OR uniq_src > 6000)                                                                   AS rule_flag,
   (pps > 9000 OR uniq_src > 3000 OR uniq_dst_ports > 100 OR syn_only_ratio > 0.5 OR udp_share > 0.5)  AS candidate,
@@ -150,7 +150,7 @@ FROM (
 -- 5. decisions, only for candidate windows (a handful per minute)
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ddos_decide_action INTO decision_log AS
 SELECT
-  'ddos' AS use_case, window_start, dst_ip AS cohort, question, 'choice' AS qtype,
+  'ddos' AS use_case, win_start, dst_ip AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
   to_float32_or_null(json_extract_raw(d, 'p'))     AS p,
   to_float32_or_null(json_extract_raw(d, 'p_raw')) AS p_raw,
@@ -162,7 +162,7 @@ SELECT
   json_extract_string(d, 'err')                    AS err,
   rule_flag, truth, expected_action AS expected, to_uint32(length(state)) AS state_chars
 FROM (
-  SELECT window_start, dst_ip, rule_flag, truth, expected_action, state, question,
+  SELECT win_start, dst_ip, rule_flag, truth, expected_action, state, question,
          decide_choice(state, question, '["mitigate","observe","escalate"]') AS d
   FROM (
     SELECT *, 'What should the edge do now for this service? mitigate = rate-limit or block the offending traffic, observe = keep watching, escalate = page a human.' AS question
@@ -172,7 +172,7 @@ FROM (
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ddos_decide_kind INTO decision_log AS
 SELECT
-  'ddos' AS use_case, window_start, dst_ip AS cohort, question, 'choice' AS qtype,
+  'ddos' AS use_case, win_start, dst_ip AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
   to_float32_or_null(json_extract_raw(d, 'p'))     AS p,
   to_float32_or_null(json_extract_raw(d, 'p_raw')) AS p_raw,
@@ -184,7 +184,7 @@ SELECT
   json_extract_string(d, 'err')                    AS err,
   rule_flag, truth, expected_kind AS expected, to_uint32(length(state)) AS state_chars
 FROM (
-  SELECT window_start, dst_ip, rule_flag, truth, expected_kind, state, question,
+  SELECT win_start, dst_ip, rule_flag, truth, expected_kind, state, question,
          decide_choice(state, question,
            '["syn_flood","udp_amplification","http_flood","port_scan","legitimate_surge","normal"]') AS d
   FROM (
