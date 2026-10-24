@@ -6,17 +6,17 @@ Python UDF **that runs inside the engine**. The backend is swappable: **Jev Clou
 model served locally by Ollama** (no outbound network). Data is generated inside the engine with random streams.
 
 **Nothing runs on your machine except Docker and SQL.** The install is five SQL files applied in order; the
-only Python in the project is the UDF body in `sql/02_udf.sql`, executed by Timeplus. The engine is **Timeplus
+only Python in the project is the UDF body in `sql/01_udf.sql`, executed by Timeplus. The engine is **Timeplus
 Enterprise (amd64 build)**: Python UDFs are not built into Proton OSS or the arm64 images.
 
-Two use cases are built; three more are documented as references in the proposal.
+Two use cases are built as **two independent pipelines, each in its own database** (`qoe` and `ddos`) with its own decision log; they share only the UDF. Three more use cases are documented as references in the proposal.
 
 ```
                  ┌──────────────── inside the engine (streaming SQL) ────────────────┐
 random stream ──► generator view ──► events ──► window view (5 s, rule flag, truth) ──► decision view
  (seeds)          (scenario by time)                                                      │ decide_choice / decide_score
                                                                                           ▼
-                                             Ollama · Jev Cloud · fake  ◄──── Python UDF ──► decision_log ──► scorecard
+                                             Ollama · Jev Cloud · fake  ◄──── Python UDF ──► <db>.decision_log ──► scorecard
 ```
 
 | Use case | Window | Questions to the model | Designed rule gaps |
@@ -34,14 +34,14 @@ scorecard needs no labels.
 cp .env.example .env                              # backend=local, model=tev1:0.8b
 docker compose --profile ollama up -d             # engine + Ollama
 ./scripts/pull_model.sh                           # pulls tev1:0.8b (~0.8B, CPU-friendly), smoke-tests /v1/systemone
-./scripts/install.sh                              # sql/01 02 03 10 20: streams, UDF, smoke test, both use cases
+./scripts/install.sh                              # UDF, smoke test, then both pipelines (databases qoe and ddos)
 ```
 
 `install.sh` is a ten-line loop that pipes each file into the `timeplusd client` that ships inside the engine
 container. You can equally paste the files into the console at <http://localhost:8000> (user `proton`,
 password `timeplus@t+`) or run `docker exec -it tp-decision-poc timeplusd client -u proton --password 'timeplus@t+'`.
 
-Then run queries from `sql/04_demo_queries.sql`. Query **B** is the one-screen scorecard (model accuracy vs
+Then run queries from `sql/qoe/20_queries.sql` or `sql/ddos/20_queries.sql` (same letters in both), and `sql/90_results.sql` for both logs side by side. Query **B** is the one-screen scorecard (model accuracy vs
 rule accuracy, auto-decide share, p50/p99 latency, per minute); **D** shows the two designed rule gaps live;
 **G** shows the exact text the model is given.
 
@@ -53,19 +53,23 @@ rule accuracy, auto-decide share, p50/p99 latency, per minute); **D** shows the 
 - Apple silicon: the engine image is pinned to `linux/amd64` and runs under emulation. It is slower but fine for the demo.
 - Changing `DECISION_*` in `.env`: `docker compose up -d` recreates the engine with the new environment; the UDF reads it at first call.
 - Chaos: `docker compose stop decision-ollama`; `err` becomes `conn_error`, `p` NULL, views stay alive; `start` it again.
-- Tear down: `./scripts/install.sh --teardown` (runs `sql/99_teardown.sql`).
+- One pipeline only: `./scripts/install.sh --only qoe` (or `ddos`); tear one down with `./scripts/install.sh --teardown qoe`.
+- Tear down everything: `./scripts/install.sh --teardown` (both databases and the UDF).
 
 ## The SQL files
 
+Each pipeline is self-contained in its own database: streams, views and decision log all live under `qoe.` or `ddos.`, every reference is database-qualified, and `DROP DATABASE … CASCADE` removes a pipeline in one statement. Functions are global in Timeplus, so the UDF is shared.
+
 | File | What | Apply |
 | --- | --- | --- |
-| `sql/01_streams.sql` | `decision_log`, the shared append-only audit trail. | always |
-| `sql/02_udf.sql` | **The UDF.** One `CREATE FUNCTION decide(...) LANGUAGE PYTHON` with the whole module inline, plus three SQL lambdas (`decide_noul`, `decide_choice`, `decide_score`) that give the views typed names. Edit the Python here; there is no generator. | always |
-| `sql/03_smoke.sql` | One `SELECT` calling each question type: the first in-engine check, before any stream exists. | always |
-| `sql/10_qoe.sql` | Use case 1: `qoe_raw` → `mv_qoe_gen` → `qoe_events` → `mv_qoe_windows` → `qoe_windows` → `mv_qoe_decide_cause`, `mv_qoe_decide_severity`. | either / both |
-| `sql/20_ddos.sql` | Use case 2: `flow_raw` → `mv_flow_gen` → `flow_records` → `mv_flow_windows` → `flow_windows` → `mv_ddos_decide_action`, `mv_ddos_decide_kind`. | either / both |
-| `sql/04_demo_queries.sql` | Live feed, scorecard, confusion by scenario, rule-gap view, calibration buckets, backend health, results. | by hand |
-| `sql/99_teardown.sql` | Drops everything in the right order (views, streams, functions, log). | to reset |
+| `sql/01_udf.sql` | **The UDF.** One `CREATE FUNCTION decide(...) LANGUAGE PYTHON` with the whole module inline, plus three SQL lambdas (`decide_noul`, `decide_choice`, `decide_score`) that give the views typed names. Edit the Python here; there is no generator. | always |
+| `sql/02_smoke.sql` | One `SELECT` calling each question type: the first in-engine check, before any stream exists. | always |
+| `sql/qoe/10_pipeline.sql` | Pipeline 1, database `qoe`: `decision_log`, `seeds` → `mv_generate` → `events` → `mv_windows` → `windows` → `mv_decide_cause`, `mv_decide_severity` → `decision_log`. | either / both |
+| `sql/ddos/10_pipeline.sql` | Pipeline 2, database `ddos`: `decision_log`, `seeds` → `mv_generate` → `records` → `mv_windows` → `windows` → `mv_decide_action`, `mv_decide_kind` → `decision_log`. | either / both |
+| `sql/<pipeline>/20_queries.sql` | Live feed, scorecard, confusion by scenario, rule-gap view, calibration buckets, backend health, results, per pipeline. | by hand |
+| `sql/90_results.sql` | Both decision logs side by side for the report. | by hand |
+| `sql/<pipeline>/99_teardown.sql` | `DROP DATABASE <pipeline> CASCADE`. | to reset one |
+| `sql/99_teardown.sql` | Both databases and the UDF. | to reset all |
 
 Other files: `backend/fake_systemone.py` is a stdlib `/v1/systemone` stand-in (noisy heuristic, **not a model**)
 that runs in its own container for wiring and chaos tests; `backend/Dockerfile.local` + `entrypoint.sh` build a
@@ -145,7 +149,7 @@ Random streams generate only while a view reads them, so stopping the generator 
 
 - Returns JSON strings parsed in the view; a `tuple` return type is a later optimization.
 - Accuracy numbers from the `mock` or fake backends say nothing about model quality.
-- No unit tests outside the engine by design (nothing runs on the host). `sql/03_smoke.sql` and the `err` column of
-  `decision_log` are the checks.
+- No unit tests outside the engine by design (nothing runs on the host). `sql/02_smoke.sql` and the `err` column of
+  each `decision_log` are the checks.
 - The `tev1` models have no published CPU latency; expect roughly 0.3–0.6 s per 8-row request on a modern 8-core laptop
   for the 0.8B model (estimate), and 100–250 ms on an L4/T4-class GPU for 2B-class models.

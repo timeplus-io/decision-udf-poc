@@ -1,20 +1,44 @@
--- 20_ddos.sql — Use case 2: edge flow-anomaly (DDoS) response.
--- Generic NetFlow-like schema: no customer fields.
+-- ddos/10_pipeline.sql — Use case 2: edge flow-anomaly (DDoS) response. Everything lives in database `ddos`.
+-- Generic NetFlow-like schema: no customer fields. Needs the shared UDF from sql/01_udf.sql.
 --
---   flow_raw (random seeds) -> mv_flow_gen -> flow_records -> mv_flow_windows -> flow_windows
---   -> mv_ddos_decide_action / mv_ddos_decide_kind -> decision_log
+--   ddos.seeds (random) -> ddos.mv_generate -> ddos.records -> ddos.mv_windows -> ddos.windows
+--   -> ddos.mv_decide_action / ddos.mv_decide_kind -> ddos.decision_log
 --
 -- Scenario schedule: one scenario per 60 s period from the wall clock.
 --   sid = int_div(unix_ts, 60) % 6 : 0 none | 1 syn_flood | 2 udp_amplification | 3 http_flood | 4 port_scan | 5 flash_crowd
 --   victim for the period: svc-(period % 8). A port scan hits every service from one small source pool.
 
+CREATE DATABASE IF NOT EXISTS ddos;
+
+-- 0. every decision this pipeline makes, appended forever: audit trail, scorecard source, replay source
+CREATE STREAM IF NOT EXISTS ddos.decision_log (
+  use_case      string,              -- constant per pipeline, kept so logs can be unioned
+  win_start     datetime64(3),       -- window_start is a reserved column name in Timeplus Enterprise
+  cohort        string,              -- qoe: global ; ddos: dst_ip
+  question      string,
+  qtype         string,              -- choice | score | noul
+  decision      string,              -- chosen option / level
+  p             nullable(float32),   -- calibrated probability of the chosen answer
+  p_raw         nullable(float32),
+  probabilities string,              -- JSON, all options
+  model         string,
+  backend       string,
+  latency_ms    uint32,
+  batch         string,
+  err           string,
+  rule_flag     bool,                -- what the threshold rule said
+  truth         string,              -- ground truth from the scenario schedule
+  expected      string,              -- expected answer for this question (truth mapped to the option set)
+  state_chars   uint32
+);
+
 -- 1. random seeds, ~5,000 records/s
-CREATE RANDOM STREAM IF NOT EXISTS flow_raw (
+CREATE RANDOM STREAM IF NOT EXISTS ddos.seeds (
   s1 uint32 DEFAULT rand(), s2 uint32 DEFAULT rand(), s3 uint32 DEFAULT rand(), s4 uint32 DEFAULT rand()
 ) SETTINGS eps = 5000;
 
 -- 2. flow records
-CREATE STREAM IF NOT EXISTS flow_records (
+CREATE STREAM IF NOT EXISTS ddos.records (
   src_ip      string,
   dst_ip      string,     -- one of 8 protected services: svc-0 .. svc-7
   dst_port    uint16,
@@ -28,7 +52,7 @@ CREATE STREAM IF NOT EXISTS flow_records (
 );
 
 -- 3. generator
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_flow_gen INTO flow_records AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS ddos.mv_generate INTO ddos.records AS
 SELECT
   multi_if(
     scenario = 'udp_amplification' AND attack_flow, '198.51.100.' || to_string(s2 % 50),            -- ~50 reflectors
@@ -74,11 +98,11 @@ FROM (
       scenario = 'port_scan',         s4 % 100 < 10,
       scenario = 'flash_crowd',       s4 % 100 < 50,
       false)                                               AS attack_flow
-  FROM flow_raw
+  FROM ddos.seeds
 );
 
 -- 4. condensed 5 s windows per protected service
-CREATE STREAM IF NOT EXISTS flow_windows (
+CREATE STREAM IF NOT EXISTS ddos.windows (
   win_start       datetime64(3),   -- window_start is a reserved column name
   dst_ip          string,
   records         uint32,
@@ -98,7 +122,7 @@ CREATE STREAM IF NOT EXISTS flow_windows (
   state           string
 );
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_flow_windows INTO flow_windows AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS ddos.mv_windows INTO ddos.windows AS
 SELECT
   window_start AS win_start, dst_ip, records, pps, mbps, uniq_src, syn_only_ratio, udp_share, mean_pkt_bytes, uniq_dst_ports,
   p443, p80, p53, p123, p11211,
@@ -143,12 +167,12 @@ FROM (
       sched = 'port_scan', 'port_scan',
       dst_ip = 'svc-' || to_string(int_div(to_unix_timestamp(window_start), 60) % 8), sched,
       'none')                                                          AS truth
-  FROM tumble(flow_records, 5s)
+  FROM tumble(ddos.records, 5s)
   GROUP BY window_start, dst_ip
 );
 
 -- 5. decisions, only for candidate windows (a handful per minute)
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ddos_decide_action INTO decision_log AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS ddos.mv_decide_action INTO ddos.decision_log AS
 SELECT
   'ddos' AS use_case, win_start, dst_ip AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
@@ -166,11 +190,11 @@ FROM (
          decide_choice(state, question, '["mitigate","observe","escalate"]') AS d
   FROM (
     SELECT *, 'What should the edge do now for this service? mitigate = rate-limit or block the offending traffic, observe = keep watching, escalate = page a human.' AS question
-    FROM flow_windows WHERE candidate
+    FROM ddos.windows WHERE candidate
   )
 );
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_ddos_decide_kind INTO decision_log AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS ddos.mv_decide_kind INTO ddos.decision_log AS
 SELECT
   'ddos' AS use_case, win_start, dst_ip AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
@@ -189,6 +213,6 @@ FROM (
            '["syn_flood","udp_amplification","http_flood","port_scan","legitimate_surge","normal"]') AS d
   FROM (
     SELECT *, 'What kind of traffic is this service receiving in this window?' AS question
-    FROM flow_windows WHERE candidate
+    FROM ddos.windows WHERE candidate
   )
 );

@@ -1,4 +1,4 @@
--- 02_udf.sql — the decision UDF. One Python UDF (`decide`) that runs inside Timeplus, plus three SQL
+-- 01_udf.sql — the decision UDF. One Python UDF (`decide`) that runs inside Timeplus, plus three SQL
 -- lambda wrappers that give the views the typed names. This file is the source of truth: edit the Python
 -- here. Requires Timeplus Enterprise (Python UDFs are not built into Proton OSS).
 --
@@ -266,14 +266,14 @@ def _http_backend(states, question, qtype, options, deadline):
 # Mock backend: a transparent keyword heuristic so the SQL pipeline can be exercised with no model at all.
 # It is NOT a model and its accuracy on the simulators means nothing; use it only for wiring and chaos tests.
 _KW = {
-    # QoE causes (substrings of the window state text produced by sql/10_qoe.sql)
+    # QoE causes (substrings of the window state text produced by sql/qoe/10_pipeline.sql)
     "cdn_fault": ("1 of 3 cdns",), "isp_congestion": ("1 of 6 isps",),
     "player_bug": ("1 of 3 player",), "encoding_issue": ("1 of 20 assets",),
     "traffic_spike_benign": ("load_ratio=3", "load_ratio=4", "load_ratio=5", "load_ratio=6"),
     "no_incident": ("no threshold alert",),
     "negligible": ("no threshold alert",), "minor": ("1 of 20 assets",), "major": ("1 of 6 isps", "1 of 3 player"),
     "critical": ("1 of 3 cdns",),
-    # DDoS kinds / actions (substrings of the state text produced by sql/20_ddos.sql)
+    # DDoS kinds / actions (substrings of the state text produced by sql/ddos/10_pipeline.sql)
     "syn_flood": ("syn_only_ratio=0.8", "syn_only_ratio=0.9", "syn_only_ratio=1"),
     "udp_amplification": ("udp_share=0.6", "udp_share=0.7", "udp_share=0.8", "udp_share=0.9"),
     "http_flood": ("mean_packet_bytes=6", "pps=5"),
