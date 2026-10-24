@@ -113,7 +113,7 @@ If a customer has no GPU and needs more than alert-rate volume, the follow-on is
 
 ## Python UDF design
 
-One Python UDF, `decide(state, question, kind, spec)`, runs inside the engine. It reads its configuration from the engine's environment on first call, packs each block into a few requests, and turns every failure into a NULL row rather than an exception. Three SQL lambda functions give the views typed names without a second copy of the Python. The whole thing is one file, `sql/02_udf.sql`, applied like any other SQL file; there is no generator, no package install and no host-side tooling.
+One Python UDF, `decide(state, question, kind, spec)`, runs inside the engine. It reads its configuration from the engine's environment on first call, packs each block into a few requests, and turns every failure into a NULL row rather than an exception. Three SQL lambda functions give the views typed names without a second copy of the Python. The whole thing is one file, `sql/01_udf.sql`, applied like any other SQL file; there is no generator, no package install and no host-side tooling.
 
 **SQL surface**
 
@@ -130,7 +130,7 @@ CREATE OR REPLACE FUNCTION decide_score  AS (state, question, levels)  -> decide
 Each call returns one JSON string per row (`choice`/`level`/`p`, `p_raw`, `probabilities`, `model`, `backend`, `latency_ms`, `batch`, `err`), which the view parses with `json_extract_*`. A `tuple` return type is a later optimization. A materialized view then reads:
 
 ```sql
-CREATE MATERIALIZED VIEW mv_triage INTO decision_log AS
+CREATE MATERIALIZED VIEW triage.mv_decide INTO triage.decision_log AS
 SELECT win_start, cohort,
        json_extract_string(d, 'choice')              AS decision,
        to_float32_or_null(json_extract_raw(d, 'p'))  AS p,
@@ -138,7 +138,7 @@ SELECT win_start, cohort,
        json_extract_string(d, 'err')                 AS err
 FROM (SELECT win_start, cohort,
              decide_choice(state, 'Route this event', '["fraud_review","auto_approve","needs_info"]') AS d
-      FROM windows);
+      FROM triage.windows);
 ```
 
 The state is built in SQL, which keeps the UDF generic: callers decide what context goes in, and can trim it, since accuracy degrades as irrelevant state grows.
@@ -158,7 +158,7 @@ The state is built in SQL, which keeps the UDF generic: callers decide what cont
 | Observability | Each row carries `latency_ms` (per request) and a 4-character `batch` id, so the scorecard can see packing and p50/p99 directly in `decision_log` | The benchmark reads these directly; no separate metrics stream |
 | HTTP client | Python standard library (`urllib`), no `requests`, no `numpy` | No `SYSTEM INSTALL PYTHON PACKAGE` step, no wheel vendoring for air-gapped installs, nothing to wait for on first call |
 
-**Install** is five SQL files in order, `sql/01_streams.sql` (decision log), `02_udf.sql`, `03_smoke.sql` (one `SELECT` per question type, the first in-engine check), `10_qoe.sql`, `20_ddos.sql`, plus `99_teardown.sql`. `scripts/install.sh` is a bash loop that pipes each file into the `timeplusd client` that ships inside the engine container; the files can equally be pasted into the console.
+**Install** is SQL files in order: the shared `sql/01_udf.sql` and `02_smoke.sql` (one `SELECT` per question type, the first in-engine check), then one file per pipeline, `sql/qoe/10_pipeline.sql` and `sql/ddos/10_pipeline.sql`. Each pipeline is a separate namespace: its streams, views and its own `decision_log` live in a database of the same name, every reference is database-qualified, and `DROP DATABASE … CASCADE` (`sql/<pipeline>/99_teardown.sql`) removes it in one statement. Functions are global in Timeplus, so the UDF is shared; `sql/99_teardown.sql` removes both databases and the UDF. `scripts/install.sh` is a bash loop that pipes each file into the `timeplusd client` that ships inside the engine container; the files can equally be pasted into the console.
 
 **Engine facts settled while building** (Timeplus Enterprise 3.4.1): Python UDFs exist only in the amd64 build, so compose pins `platform: linux/amd64` (Apple silicon runs it under emulation); Proton OSS and the arm64 images reject `LANGUAGE PYTHON`. `window_start` and `window_end` are reserved column names in `CREATE STREAM`, so stored columns are named `win_start`. timeplusd preallocates about 2 GB of native log per stream unless `ENABLE_DATA_PREALLOCATE=false`, which compose sets, and it refuses `CREATE` when its disk is over 90% full. The init hook (`SETTINGS init_function_name`) works on this build but is not used.
 
@@ -172,21 +172,21 @@ Both use cases follow the same four-stage shape inside the engine: random stream
 
 | Stage | Content |
 | --- | --- |
-| Random stream `qoe_raw` | Seeds only, 2,000 events/s |
-| Generator view, `qoe_events` | `session_id`, `cdn` (3), `isp` (6), `region` (5), `player_version` (3), `asset_id` (20), `rebuffer_ms`, `startup_ms`, `bitrate_kbps`, `error_code` (`none`, `edge_503`, `segment_timeout`, `decoder_error`, `abr_null_ref`) |
+| Random stream `qoe.seeds` | Seeds only, 2,000 events/s |
+| Generator view `qoe.mv_generate` → `qoe.events` | `session_id`, `cdn` (3), `isp` (6), `region` (5), `player_version` (3), `asset_id` (20), `rebuffer_ms`, `startup_ms`, `bitrate_kbps`, `error_code` (`none`, `edge_503`, `segment_timeout`, `decoder_error`, `abr_null_ref`) |
 | Scenarios (6) | `none`; `cdn_fault` (one CDN: rebuffer up, `edge_503` and `segment_timeout`); `isp_congestion` (one ISP: bitrate down, rebuffer up, no errors); `player_bug` (one player version: `abr_null_ref`, startup up); `encoding_issue` (one asset: `decoder_error`); `flash_crowd` (all cohorts: sessions up, metrics normal, the designed rule false alarm) |
-| Window view, `qoe_windows` | Per 5 s, global: events, sessions, load ratio, degraded share, p95 rebuffer, p50 startup and bitrate, error mix, plus how many CDNs/ISPs/regions/players/assets the degraded sessions span (the concentration signal); `rule_flag` when p95 rebuffer, degraded share or load ratio crosses a fixed threshold; `truth`, `expected_cause`, `expected_sev` from the schedule; `state` is the text handed to the model |
-| Decision views | For every window: `decide_choice(state, "What is the most likely cause…?", [cdn_fault, isp_congestion, player_bug, encoding_issue, traffic_spike_benign, no_incident])` and `decide_score(state, "How severe is this window for viewers?", [negligible, minor, major, critical])`, one row each into `decision_log` |
+| Window view `qoe.mv_windows` → `qoe.windows` | Per 5 s, global: events, sessions, load ratio, degraded share, p95 rebuffer, p50 startup and bitrate, error mix, plus how many CDNs/ISPs/regions/players/assets the degraded sessions span (the concentration signal); `rule_flag` when p95 rebuffer, degraded share or load ratio crosses a fixed threshold; `truth`, `expected_cause`, `expected_sev` from the schedule; `state` is the text handed to the model |
+| Decision views | For every window: `decide_choice(state, "What is the most likely cause…?", [cdn_fault, isp_congestion, player_bug, encoding_issue, traffic_spike_benign, no_incident])` and `decide_score(state, "How severe is this window for viewers?", [negligible, minor, major, critical])`, one row each into `qoe.decision_log` |
 | Rule pack gap | Thresholds fire on `flash_crowd` (benign) and cannot name a cause; the model is scored on cause accuracy and on clearing the false alarm |
 
 **Use case 2: edge flow-anomaly (DDoS) response**
 
 | Stage | Content |
 | --- | --- |
-| Random stream `flow_raw` | Seeds only, 5,000 records/s |
-| Generator view, `flow_records` | NetFlow-like: `src_ip` (synthetic /16 pools), `dst_ip` (8 protected services), `dst_port`, `proto`, `packets`, `bytes`, `tcp_flags`, `duration_ms` |
+| Random stream `ddos.seeds` | Seeds only, 5,000 records/s |
+| Generator view `ddos.mv_generate` → `ddos.records` | NetFlow-like: `src_ip` (synthetic /16 pools), `dst_ip` (8 protected services), `dst_port`, `proto`, `packets`, `bytes`, `tcp_flags`, `duration_ms` |
 | Scenarios (6) | `none`; `syn_flood` (one dst: many sources, SYN-only, tiny packets); `udp_amplification` (one dst: few sources, UDP 53/123/11211, large packets); `http_flood` (one dst: moderate sources, full handshakes, port 443, high pps); `port_scan` (one src pool sweeping ports on many dsts, low volume, the designed rule miss); `flash_crowd` (one dst: many sources, normal packet mix, the designed rule false alarm) |
-| Window view, `flow_windows` | Per 5 s and `dst_ip`: pps, mbps, unique sources, SYN-only ratio, UDP share, mean packet size, distinct ports, flows by port; `rule_flag` when pps or unique sources cross a threshold; a looser `candidate` gate decides which windows the model sees; `truth`, `expected_action`, `expected_kind` from the schedule; `state` is the text handed to the model |
+| Window view `ddos.mv_windows` → `ddos.windows` | Per 5 s and `dst_ip`: pps, mbps, unique sources, SYN-only ratio, UDP share, mean packet size, distinct ports, flows by port; `rule_flag` when pps or unique sources cross a threshold; a looser `candidate` gate decides which windows the model sees; `truth`, `expected_action`, `expected_kind` from the schedule; `state` is the text handed to the model |
 | Decision views | For candidate windows: `decide_choice(state, "What should the edge do now…?", [mitigate, observe, escalate])` and `decide_choice(state, "What kind of traffic is this service receiving…?", [syn_flood, udp_amplification, http_flood, port_scan, legitimate_surge, normal])` |
 | Rule pack gap | Thresholds fire on `flash_crowd` and miss `port_scan`; the model is scored on action accuracy against the schedule's expected action (`mitigate` for floods and amplification, `observe` for scans and surges) |
 
@@ -212,7 +212,7 @@ Both use cases follow the same four-stage shape inside the engine: random stream
 
 ## Benchmark and evaluation plan
 
-Every run writes to `decision_log` (with per-row `latency_ms` and `batch`), so the benchmark is a set of Timeplus queries over the same streams the demo uses, repeated per backend and per host.
+Every run writes to its pipeline's `decision_log` (`qoe.decision_log`, `ddos.decision_log`, with per-row `latency_ms` and `batch`), so the benchmark is a set of Timeplus queries over the same streams the demo uses, repeated per backend and per host.
 
 **Test environment**
 
@@ -254,8 +254,8 @@ Engineering runs top to bottom; the two use cases share the UDF and the compose 
 | Workstream | Effort | Owner |
 | --- | --- | --- |
 | Repo scaffold, compose for Timeplus Enterprise, UDF with `choice`/`score`/`noul`, pure-SQL install, Jev Cloud path | 4 engineer-days | Backend engineer (to assign) |
-| Use case 1 SQL: `qoe_raw`, generator, windows, decision view, scorecard | 3 engineer-days | Same engineer |
-| Use case 2 SQL: `flow_raw`, generator, windows, decision view, scorecard | 3 engineer-days | Same engineer |
+| Use case 1 SQL (database `qoe`): seeds, generator, windows, decision view, scorecard | 3 engineer-days | Same engineer |
+| Use case 2 SQL (database `ddos`): seeds, generator, windows, decision view, scorecard | 3 engineer-days | Same engineer |
 | Local image: llama-server build, candidate GGUFs, SHA pinning, air-gap test | 3 engineer-days | Same engineer |
 | Latency, throughput, resilience runs on CPU and GPU boxes, both engines | 3 engineer-days | Same engineer, plus infra for the L4 host |
 | Calibration fitting, accuracy and ECE from the scenario schedule, quantization check | 2 engineer-days | Same engineer |
@@ -295,13 +295,13 @@ The biggest technical risk is CPU-only hosts: a 2B decoder is 1 to 3 s per decis
 
 The PoC ends with a working, switchable decision UDF, a measured comparison of the two backends, and a one-page recommendation on whether to productize and in what shape.
 
-**Status** (Oct 23, 2026): the repository `timeplus-io/decision-udf-poc` holds the UDF as one SQL file (`decide` plus the three lambdas), the two use cases as streaming SQL (random streams, generator views, window views, decision views, scorecards), a smoke test and teardown file, the fake backend, the llama-server image recipe and a compose file for Timeplus Enterprise. The install is pure SQL; the host-side Python (setup script, DDL generator, offline evaluator, unit tests) was removed. Verified inside Timeplus Enterprise 3.4.1 (amd64) against the fake backend: the smoke test answers all three question types, both use cases write to `decision_log` with empty `err` and 8-row packing, a backend outage yields `conn_error` rows while all eight views stay alive and decisions resume on restart, and teardown plus reinstall is clean. Next: the same run against Ollama `tev1:0.8b` and against Jev Cloud, then the results tab.
+**Status** (Oct 23, 2026): the repository `timeplus-io/decision-udf-poc` holds the UDF as one SQL file (`decide` plus the three lambdas), the two use cases as two independent streaming-SQL pipelines, each in its own database (`qoe`, `ddos`) with its own decision log (random streams, generator views, window views, decision views, scorecards), a smoke test and per-pipeline teardown files, the fake backend, the llama-server image recipe and a compose file for Timeplus Enterprise. The install is pure SQL; the host-side Python (setup script, DDL generator, offline evaluator, unit tests) was removed. Verified inside Timeplus Enterprise 3.4.1 (amd64) against the fake backend: the smoke test answers all three question types, both use cases write to `decision_log` with empty `err` and 8-row packing, a backend outage yields `conn_error` rows while all eight views stay alive and decisions resume on restart, and teardown plus reinstall is clean. Next: the same run against Ollama `tev1:0.8b` and against Jev Cloud, then the results tab.
 
 **Deliverables**
 
 - [x] GitHub repository under the Timeplus org, runnable with `docker compose up` plus a pure-SQL install on Timeplus Enterprise (amd64)
-- [x] `sql/02_udf.sql`: one Python UDF `decide` plus the `decide_choice`, `decide_score`, `decide_noul` lambdas; env-based config, packing, fallback, calibration hooks, model pinning (verified in-engine with the fake backend)
-- [x] Use case 1 and 2 as pure streaming SQL: random streams, generator views with the scenario schedule, window views, decision views, scorecard queries (verified in-engine)
+- [x] `sql/01_udf.sql`: one Python UDF `decide` plus the `decide_choice`, `decide_score`, `decide_noul` lambdas; env-based config, packing, fallback, calibration hooks, model pinning (verified in-engine with the fake backend)
+- [x] Use case 1 and 2 as pure streaming SQL, one database each: random streams, generator views with the scenario schedule, window views, decision views, scorecard queries (verified in-engine)
 - [ ] Local backend image with an Apache-2.0 decision GGUF, SHA-pinned, plus the air-gap test script
 - [ ] Results tab in this doc: latency, throughput, resilience, accuracy, ECE, auto-decide share and cost per backend, engine and host
 - [ ] Fitted temperatures per model and quantization (`DECISION_TEMPERATURES`), fitted from `decision_log` with SQL, no host tooling

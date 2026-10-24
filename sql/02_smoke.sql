@@ -1,4 +1,4 @@
--- 03_smoke.sql — first in-engine check after 02_udf.sql: one call per question type, no streams involved.
+-- 02_smoke.sql — first in-engine check after 01_udf.sql: one call per question type, no streams involved.
 -- A healthy answer has "err":"" and a non-null decision; a backend problem shows up as err=conn_error / timeout /
 -- model_mismatch / http_5xx with null decision fields (the function never raises).
 SELECT

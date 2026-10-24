@@ -1,20 +1,44 @@
--- 10_qoe.sql — Use case 1: streaming video QoE incident triage.
--- Generic schema (public QoE conventions): no customer fields.
+-- qoe/10_pipeline.sql — Use case 1: streaming video QoE incident triage. Everything lives in database `qoe`.
+-- Generic schema (public QoE conventions): no customer fields. Needs the shared UDF from sql/01_udf.sql.
 --
---   qoe_raw (random seeds) -> mv_qoe_gen -> qoe_events -> mv_qoe_windows -> qoe_windows
---   -> mv_qoe_decide_cause / mv_qoe_decide_severity -> decision_log
+--   qoe.seeds (random) -> qoe.mv_generate -> qoe.events -> qoe.mv_windows -> qoe.windows
+--   -> qoe.mv_decide_cause / qoe.mv_decide_severity -> qoe.decision_log
 --
 -- Scenario schedule: one scenario per 60 s period, chosen from the wall clock, so truth is known per window.
 --   sid = int_div(unix_ts, 60) % 6 : 0 none | 1 cdn_fault | 2 isp_congestion | 3 player_bug | 4 encoding_issue | 5 flash_crowd
 --   affected cohort for the period: cdn-(period%3), isp-(period%6), player 5.(period%3).0, asset-(period%20)
 
--- 1. random seeds, ~2,000 events/s (generated only while mv_qoe_gen reads them)
-CREATE RANDOM STREAM IF NOT EXISTS qoe_raw (
+CREATE DATABASE IF NOT EXISTS qoe;
+
+-- 0. every decision this pipeline makes, appended forever: audit trail, scorecard source, replay source
+CREATE STREAM IF NOT EXISTS qoe.decision_log (
+  use_case      string,              -- constant per pipeline, kept so logs can be unioned
+  win_start     datetime64(3),       -- window_start is a reserved column name in Timeplus Enterprise
+  cohort        string,              -- qoe: global ; ddos: dst_ip
+  question      string,
+  qtype         string,              -- choice | score | noul
+  decision      string,              -- chosen option / level
+  p             nullable(float32),   -- calibrated probability of the chosen answer
+  p_raw         nullable(float32),
+  probabilities string,              -- JSON, all options
+  model         string,
+  backend       string,
+  latency_ms    uint32,
+  batch         string,
+  err           string,
+  rule_flag     bool,                -- what the threshold rule said
+  truth         string,              -- ground truth from the scenario schedule
+  expected      string,              -- expected answer for this question (truth mapped to the option set)
+  state_chars   uint32
+);
+
+-- 1. random seeds, ~2,000 events/s (generated only while qoe.mv_generate reads them)
+CREATE RANDOM STREAM IF NOT EXISTS qoe.seeds (
   s1 uint32 DEFAULT rand(), s2 uint32 DEFAULT rand(), s3 uint32 DEFAULT rand(), s4 uint32 DEFAULT rand()
 ) SETTINGS eps = 2000;
 
 -- 2. generic player telemetry
-CREATE STREAM IF NOT EXISTS qoe_events (
+CREATE STREAM IF NOT EXISTS qoe.events (
   session_id     string,
   cdn            string,
   isp            string,
@@ -31,7 +55,7 @@ CREATE STREAM IF NOT EXISTS qoe_events (
 );
 
 -- 3. generator: cohort from seeds, metrics shifted only for the affected cohort of the active scenario
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_gen INTO qoe_events AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS qoe.mv_generate INTO qoe.events AS
 SELECT
   session_id, cdn, isp, region, player_version, asset_id,
   to_uint8(if(scenario = 'flash_crowd', 3 + s4 % 4, 1))                                            AS requests,
@@ -73,11 +97,11 @@ FROM (
       scenario = 'encoding_issue', s1 % 20 = period % 20,
       scenario = 'flash_crowd',    true,
       false)                                               AS affected
-  FROM qoe_raw
+  FROM qoe.seeds
 );
 
 -- 4. condensed 5 s windows: what an operator's dashboard would show, plus the truth label
-CREATE STREAM IF NOT EXISTS qoe_windows (
+CREATE STREAM IF NOT EXISTS qoe.windows (
   win_start       datetime64(3),   -- window_start is a reserved column name
   events          uint32,
   sessions        uint32,
@@ -102,7 +126,7 @@ CREATE STREAM IF NOT EXISTS qoe_windows (
   state           string     -- the text the model is given
 );
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_windows INTO qoe_windows AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS qoe.mv_windows INTO qoe.windows AS
 SELECT
   window_start AS win_start, events, sessions, load_ratio, degraded_share, p95_rebuffer_ms, p50_startup_ms, p50_bitrate,
   err_edge_503, err_seg_timeout, err_decoder, err_abr_null,
@@ -146,12 +170,12 @@ FROM (
     to_uint8(uniq_if(asset_id,       rebuffer_ms > 1000 OR error_code != 'none'))          AS deg_assets,
     array_element(['none','cdn_fault','isp_congestion','player_bug','encoding_issue','flash_crowd'],
                   1 + int_div(to_unix_timestamp(window_start), 60) % 6)                    AS truth
-  FROM tumble(qoe_events, 5s)
+  FROM tumble(qoe.events, 5s)
   GROUP BY window_start
 );
 
 -- 5. decisions: cause (choice) and severity (score), one each per window, into the shared log
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_decide_cause INTO decision_log AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS qoe.mv_decide_cause INTO qoe.decision_log AS
 SELECT
   'qoe' AS use_case, win_start, 'global' AS cohort, question, 'choice' AS qtype,
   json_extract_string(d, 'choice')                 AS decision,
@@ -170,11 +194,11 @@ FROM (
            '["cdn_fault","isp_congestion","player_bug","encoding_issue","traffic_spike_benign","no_incident"]') AS d
   FROM (
     SELECT *, 'What is the most likely cause of the viewer-quality situation in this window?' AS question
-    FROM qoe_windows
+    FROM qoe.windows
   )
 );
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_qoe_decide_severity INTO decision_log AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS qoe.mv_decide_severity INTO qoe.decision_log AS
 SELECT
   'qoe' AS use_case, win_start, 'global' AS cohort, question, 'score' AS qtype,
   json_extract_string(d, 'level')                  AS decision,
@@ -192,6 +216,6 @@ FROM (
          decide_score(state, question, '["negligible","minor","major","critical"]') AS d
   FROM (
     SELECT *, 'How severe is this window for viewers?' AS question
-    FROM qoe_windows
+    FROM qoe.windows
   )
 );
